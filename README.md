@@ -11,7 +11,7 @@ Run the following loader in Matcha:
 ## Features
 
 - Accurate OuterRing tracking with configurable click timing.
-- Automatic cursor calibration for Windows display scaling, with hover activation.
+- Verified display-scale detection with persistent, percentage-based cursor alignment.
 - Configurable autoplay and Resolve hotkeys.
 - Camera-safe input handling while holding right click or using Shift Lock.
 - Live accuracy, error, completion, and click-timing statistics.
@@ -21,8 +21,8 @@ Run the following loader in Matcha:
 - Toggle autoplay: X by default.
 - Trigger Resolve: R by default.
 - Both shortcuts can be changed in the AutoBard tab.
-- Cursor alignment runs automatically when Roblox is focused.
-- Use Recalibrate Cursor after changing your monitor or display settings.
+- Match Display Scale (%) to Windows Settings > System > Display > Scale; it is saved automatically.
+- Detect Display Scale never overwrites a working value without reliable display data.
 
 ## Requirements
 
