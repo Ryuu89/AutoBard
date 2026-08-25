@@ -71,6 +71,7 @@ end
 
 local state = {
 	enabled = false,
+	resolveEnabled = true,
 	lastEnabled = false,
 	lastHotkey = false,
 	lastResolveHotkey = false,
@@ -164,6 +165,11 @@ local function syncSettings(now)
 		state.shiftLockOn = shiftLock
 	end
 
+	local resolveEnabled = getUIValue("ab_resolve_enabled", state.resolveEnabled)
+	if type(resolveEnabled) == "boolean" then
+		state.resolveEnabled = resolveEnabled
+	end
+
 	for _, setting in ipairs(SETTINGS) do
 		local value = getUIValue(setting.id, config[setting.name])
 		setNumber(setting.name, value, setting.min, setting.max)
@@ -220,6 +226,9 @@ end
 local function resolveBlockReason()
 	if not isCurrentRun() then
 		return "Script is no longer active"
+	end
+	if not state.resolveEnabled then
+		return "Resolve is disabled"
 	end
 	if not isrbxactive() then
 		return "Roblox is not focused"
@@ -746,13 +755,12 @@ end
 if state.hasUI then
 	UI.AddTab("Auto Bard", function(tab)
 		local playback = tab:Section("Playback", "Left")
-		playback:Toggle("ab_master", "Auto Play", false, function(enabled)
+		playback:Toggle("ab_master", "AutoPlay", false, function(enabled)
 			state.enabled = enabled == true
 			if not state.enabled then
 				cancelPendingInput("Auto Play is disabled")
 			end
 		end)
-		playback:Text("Playback Hotkey")
 		local hotkey = playback:Keybind("ab_toggle_hotkey", DEFAULT_TOGGLE_KEY, "toggle")
 		updateHotkey(hotkey, "hotkeyCode", "hotkeyName", "lastHotkey")
 		playback:Tip("Choose the key used to toggle autoplay.")
@@ -793,7 +801,12 @@ if state.hasUI then
 		end)
 
 		local resolve = tab:Section("Resolve", "Right")
-		resolve:Text("Hotkey")
+		resolve:Toggle("ab_resolve_enabled", "Resolve", true, function(enabled)
+			state.resolveEnabled = enabled == true
+			if not state.resolveEnabled and state.resolve ~= nil then
+				cancelResolve("Resolve is disabled")
+			end
+		end)
 		local resolveHotkey = resolve:Keybind("ab_resolve_hotkey", DEFAULT_RESOLVE_KEY, "toggle")
 		updateHotkey(resolveHotkey, "resolveHotkeyCode", "resolveHotkeyName", "lastResolveHotkey")
 
