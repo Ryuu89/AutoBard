@@ -11,16 +11,7 @@ local REFERENCE_DPI = 96
 local MIN_RING_SIZE = 125
 local RESOLVE_MARGIN = 48
 local RESOLVE_SETTLE_DELAY = 0.016
-local CALIBRATION_DELAY = 0.045
-local CALIBRATION_TIMEOUT = 5
-local CALIBRATION_MAX_ATTEMPTS = 3
-local CALIBRATION_MIN_SCALE = 0.75
-local CALIBRATION_MAX_SCALE = 5
-local CALIBRATION_POINTS = {
-	{ x = 0.20, y = 0.23 },
-	{ x = 0.42, y = 0.45 },
-	{ x = 0.64, y = 0.67 },
-}
+local DISPLAY_SETTINGS_FILE = "AutoBard.display.cfg"
 
 local RUN_TOKEN = {}
 _G.__MATCHA_AUTOBARD_RUN_TOKEN = RUN_TOKEN
@@ -64,6 +55,28 @@ for key, value in pairs(DEFAULT_CONFIG) do
 	config[key] = value
 end
 
+local function readStoredDisplayDpi()
+	if type(isfile) ~= "function" or type(readfile) ~= "function" then
+		return nil
+	end
+
+	local ok, value = pcall(function()
+		if not isfile(DISPLAY_SETTINGS_FILE) then
+			return nil
+		end
+		return tonumber(readfile(DISPLAY_SETTINGS_FILE))
+	end)
+	if not ok or type(value) ~= "number" or value < REFERENCE_DPI or value > REFERENCE_DPI * 5 then
+		return nil
+	end
+	return math.floor(value + 0.5)
+end
+
+local storedDisplayDpi = readStoredDisplayDpi()
+if storedDisplayDpi ~= nil then
+	config.windowsDpi = storedDisplayDpi
+end
+
 local settingsByName = {}
 for _, setting in ipairs(SETTINGS) do
 	settingsByName[setting.name] = setting
@@ -91,15 +104,18 @@ local state = {
 	resolveHotkeyName = "R",
 	shiftLockOn = false,
 	cameraGuardUntil = 0,
-	cursorCalibrated = false,
-	calibrationFailed = false,
-	calibrationRequested = true,
-	calibrationAttempts = 0,
-	calibrationRetryAt = 0,
-	calibrationStatus = "Waiting for Roblox focus",
-	lastViewportCheck = 0,
-	viewportX = 0,
-	viewportY = 0,
+	displaySource = storedDisplayDpi ~= nil and "Saved" or "Default",
+	displayStatus = (storedDisplayDpi ~= nil and "Saved" or "Default") .. " | " .. math.floor(
+		config.windowsDpi / REFERENCE_DPI * 100 + 0.5
+	) .. "%",
+	displayLocked = storedDisplayDpi ~= nil,
+	displayProbeRequested = true,
+	displaySavePending = false,
+	displaySaveAt = 0,
+	lastDisplayProbe = 0,
+	displayWidth = 0,
+	displayHeight = 0,
+	syncingDisplayScale = false,
 	lastScan = 0,
 	lastConfigSync = 0,
 	lastUISync = 0,
@@ -110,7 +126,6 @@ local state = {
 	records = {},
 	prepared = nil,
 	resolve = nil,
-	calibration = nil,
 	hasUI = UI ~= nil and UI.AddTab ~= nil and UI.GetValue ~= nil and UI.SetValue ~= nil,
 	stats = newStats(),
 }
@@ -150,24 +165,219 @@ local function setUIValue(id, value)
 	end
 end
 
-local function setCalibrationStatus(value)
-	if state.calibrationStatus == value then
+local function setDisplayDpi(value, source, persist)
+	if type(value) ~= "number" or value ~= value then
 		return
 	end
-	state.calibrationStatus = value
-	setUIValue("ab_cursor_alignment", value)
+
+	local dpi = clamp(round(value), REFERENCE_DPI, REFERENCE_DPI * 5)
+	config.windowsDpi = dpi
+	state.displaySource = source
+	local percentage = round(dpi / REFERENCE_DPI * 100)
+	state.displayStatus = source .. " | " .. percentage .. "%"
+	state.syncingDisplayScale = true
+	setUIValue("ab_display_scale", percentage)
+	state.syncingDisplayScale = false
+	setUIValue("ab_cursor_alignment", state.displayStatus)
+
+	if persist then
+		state.displaySavePending = true
+		state.displaySaveAt = tick() + 0.35
+	end
 end
 
-local function setManualScale(value)
-	if type(value) ~= "number" then
+local function setManualDisplayScale(value)
+	if state.syncingDisplayScale or type(value) ~= "number" then
 		return
 	end
+
 	local percentage = clamp(round(value), 100, 500)
 	local dpi = round(percentage * REFERENCE_DPI / 100)
-	if config.windowsDpi ~= dpi then
-		config.windowsDpi = dpi
-		state.cursorCalibrated = false
-		setCalibrationStatus("Manual | " .. percentage .. "%")
+	if dpi == config.windowsDpi then
+		return
+	end
+
+	state.displayLocked = true
+	state.displayProbeRequested = false
+	setDisplayDpi(dpi, "Custom", true)
+end
+
+local function dpiFromDimensions(physicalX, physicalY, logicalX, logicalY)
+	if type(physicalX) ~= "number" or type(physicalY) ~= "number" then
+		return nil
+	end
+	if type(logicalX) ~= "number" or type(logicalY) ~= "number" or logicalX <= 0 or logicalY <= 0 then
+		return nil
+	end
+
+	local scaleX = physicalX / logicalX
+	local scaleY = physicalY / logicalY
+	if scaleX < 0.95 or scaleX > 5.05 or scaleY < 0.90 or scaleY > 5.05 then
+		return nil
+	end
+	if math.abs(scaleX - scaleY) > math.max(0.08, scaleX * 0.10) then
+		return nil
+	end
+	if scaleX < 1.08 then
+		return nil
+	end
+	return round(clamp(scaleX, 1, 5) * REFERENCE_DPI)
+end
+
+local function readNativeDisplayDpi()
+	for _, name in ipairs({ "getwindowdpi", "getdisplaydpi", "getwindowsdpi", "getdpi" }) do
+		local provider = _G[name]
+		if type(provider) == "function" then
+			local ok, value = pcall(provider)
+			if ok and type(value) == "number" and value >= REFERENCE_DPI and value <= REFERENCE_DPI * 5 then
+				return round(value)
+			end
+		end
+	end
+
+	for _, name in ipairs({ "getdisplayscale", "getwindowscale", "getdpiscale" }) do
+		local provider = _G[name]
+		if type(provider) == "function" then
+			local ok, value = pcall(provider)
+			if ok and type(value) == "number" then
+				local factor = value <= 5 and value or value / 100
+				if factor >= 1 and factor <= 5 then
+					return round(factor * REFERENCE_DPI)
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function readDisplayResolution(provider)
+	if type(provider) ~= "function" then
+		return nil, nil
+	end
+	local ok, first, second = pcall(provider)
+	if not ok then
+		return nil, nil
+	end
+	if type(first) == "number" and type(second) == "number" then
+		return first, second
+	end
+	local valid, x, y = pcall(function()
+		return first.X, first.Y
+	end)
+	if valid and type(x) == "number" and type(y) == "number" then
+		return x, y
+	end
+	return nil, nil
+end
+
+local function inferDisplayDpi(viewport)
+	local dpi = readNativeDisplayDpi()
+	if dpi ~= nil then
+		return dpi
+	end
+
+	for _, name in ipairs({ "getscreenresolution", "getdisplayresolution", "getscreensize", "getresolution" }) do
+		local width, height = readDisplayResolution(_G[name])
+		dpi = dpiFromDimensions(width, height, viewport.X, viewport.Y)
+		if dpi ~= nil then
+			return dpi
+		end
+	end
+
+	local player = Players.LocalPlayer
+	if player == nil then
+		return nil
+	end
+
+	local mouseOk, mouseWidth, mouseHeight = pcall(function()
+		local mouse = player:GetMouse()
+		return mouse.ViewSizeX, mouse.ViewSizeY
+	end)
+	if mouseOk then
+		dpi = dpiFromDimensions(mouseWidth, mouseHeight, viewport.X, viewport.Y)
+		if dpi ~= nil then
+			return dpi
+		end
+	end
+
+	local guiOk, guiWidth, guiHeight = pcall(function()
+		local playerGui = player:FindFirstChildOfClass("PlayerGui")
+		if playerGui == nil then
+			return nil, nil
+		end
+		local bardGui = playerGui:FindFirstChild("BardGui")
+		if bardGui == nil then
+			return nil, nil
+		end
+		local size = bardGui.AbsoluteSize
+		return size.X, size.Y
+	end)
+	if guiOk then
+		dpi = dpiFromDimensions(viewport.X, viewport.Y, guiWidth, guiHeight)
+		if dpi ~= nil then
+			return dpi
+		end
+		if mouseOk then
+			return dpiFromDimensions(mouseWidth, mouseHeight, guiWidth, guiHeight)
+		end
+	end
+
+	return nil
+end
+
+local function requestDisplayCalibration()
+	state.displayLocked = false
+	state.displayProbeRequested = true
+	state.lastDisplayProbe = 0
+	state.displayStatus = "Checking display scale"
+	setUIValue("ab_cursor_alignment", state.displayStatus)
+end
+
+local function updateDisplayAlignment(now)
+	if now - state.lastDisplayProbe < 0.5 then
+		return
+	end
+	state.lastDisplayProbe = now
+
+	local camera = Workspace.CurrentCamera
+	if camera == nil then
+		return
+	end
+	local viewport = camera.ViewportSize
+	if viewport == nil or viewport.X <= 0 or viewport.Y <= 0 then
+		return
+	end
+
+	local resized = state.displayWidth ~= viewport.X or state.displayHeight ~= viewport.Y
+	state.displayWidth = viewport.X
+	state.displayHeight = viewport.Y
+	if not state.displayProbeRequested and (not resized or state.displayLocked) then
+		return
+	end
+	if state.displayLocked then
+		state.displayProbeRequested = false
+		return
+	end
+
+	state.displayProbeRequested = false
+	local dpi = inferDisplayDpi(viewport)
+	if dpi ~= nil then
+		setDisplayDpi(dpi, "Automatic", true)
+		log("Display scale detected: " .. tostring(dpi) .. " DPI")
+		return
+	end
+
+	setDisplayDpi(config.windowsDpi, state.displaySource, false)
+	log("Display DPI unavailable; keeping the working cursor alignment")
+end
+
+local function saveDisplayAlignment(now)
+	if not state.displaySavePending or now < state.displaySaveAt then
+		return
+	end
+	state.displaySavePending = false
+	if type(writefile) == "function" then
+		pcall(writefile, DISPLAY_SETTINGS_FILE, tostring(config.windowsDpi))
 	end
 end
 
@@ -215,9 +425,7 @@ local function syncSettings(now)
 		setNumber(setting.name, value, setting.min, setting.max)
 	end
 
-	if state.calibrationFailed then
-		setManualScale(getUIValue("ab_scale_override", nil))
-	end
+	setManualDisplayScale(getUIValue("ab_display_scale", nil))
 
 	local dualScan = getUIValue("ab_dual_scan", config.dualScan)
 	if type(dualScan) == "boolean" then
@@ -267,312 +475,12 @@ local function cancelPendingInput(reason)
 	log("Pending cursor action canceled: " .. reason)
 end
 
-local function calibrationBlockReason()
-	if not isCurrentRun() then
-		return "Script is no longer active"
-	end
-	if not isrbxactive() then
-		return "Roblox is not focused"
-	end
-	if state.resolve ~= nil then
-		return "Resolve is active"
-	end
-	if ismouse1pressed() then
-		return "Left mouse button is held"
-	end
-	if ismouse2pressed() then
-		return "Right mouse button is held"
-	end
-	if iskeypressed(VK_SHIFT) or state.shiftLockOn then
-		return "Shift Lock is active"
-	end
-	if tick() < state.cameraGuardUntil then
-		return "Camera input is settling"
-	end
-	return nil
-end
-
-local function requestCursorCalibration()
-	state.calibration = nil
-	state.calibrationRequested = true
-	state.calibrationFailed = false
-	state.calibrationAttempts = 0
-	state.calibrationRetryAt = tick()
-	cancelPendingInput("Cursor alignment requested")
-	setCalibrationStatus("Waiting for Roblox focus")
-end
-
-local function deferCursorCalibration(reason, now)
-	state.calibration = nil
-	state.calibrationRequested = true
-	state.calibrationRetryAt = now + 0.15
-	cancelPendingInput("Cursor alignment paused")
-	armCameraGuard()
-	setCalibrationStatus(reason == "Roblox is not focused" and "Waiting for Roblox focus" or "Waiting | " .. reason)
-end
-
-local function failCursorCalibration(reason, now)
-	state.calibration = nil
-	state.calibrationAttempts = state.calibrationAttempts + 1
-	armCameraGuard()
-	log("Cursor calibration failed: " .. reason)
-
-	if state.calibrationAttempts < CALIBRATION_MAX_ATTEMPTS then
-		state.calibrationRequested = true
-		state.calibrationRetryAt = now + state.calibrationAttempts * 0.35
-		setCalibrationStatus("Retrying automatic alignment")
-		return
-	end
-
-	state.calibrationRequested = false
-	state.calibrationFailed = true
-	local percentage = round(config.windowsDpi / REFERENCE_DPI * 100)
-	setUIValue("ab_scale_override", percentage)
-	setCalibrationStatus("Manual adjustment available | " .. percentage .. "%")
-	notify("Automatic cursor alignment failed. Open Cursor Alignment to adjust it.", "Auto Bard", 4)
-end
-
-local function readCursorPosition(mouse)
-	local ok, x, y = pcall(function()
-		return mouse.X, mouse.Y
-	end)
-	if not ok or type(x) ~= "number" or type(y) ~= "number" or x ~= x or y ~= y then
-		return nil, nil
-	end
-	return x, y
-end
-
-local function moveCalibrationCursor(calibration, now)
-	local reason = calibrationBlockReason()
-	if reason ~= nil then
-		deferCursorCalibration(reason, now)
-		return false
-	end
-
-	local point = calibration.points[calibration.index]
-	local moved, moveError = pcall(function()
-		setrobloxinput(true)
-		mousemoveabs(point.x, point.y)
-	end)
-	if not moved then
-		failCursorCalibration(tostring(moveError), now)
-		return false
-	end
-
-	reason = calibrationBlockReason()
-	if reason ~= nil then
-		deferCursorCalibration(reason, now)
-		return false
-	end
-
-	local activated, activationError = pcall(mousemoverel, 1, 0)
-	if not activated then
-		failCursorCalibration(tostring(activationError), now)
-		return false
-	end
-
-	calibration.commandX = point.x + 1
-	calibration.commandY = point.y
-	calibration.lastX = nil
-	calibration.lastY = nil
-	calibration.readyAt = now + math.max(CALIBRATION_DELAY, state.frameSeconds * 2)
-	return true
-end
-
-local function beginCursorCalibration(now)
-	local player = Players.LocalPlayer
-	local camera = Workspace.CurrentCamera
-	if player == nil or camera == nil then
-		state.calibrationRetryAt = now + 0.25
-		setCalibrationStatus("Waiting for Roblox to load")
-		return
-	end
-
-	local viewport = camera.ViewportSize
-	if viewport == nil or viewport.X < 120 or viewport.Y < 120 then
-		state.calibrationRetryAt = now + 0.25
-		setCalibrationStatus("Waiting for the Roblox window")
-		return
-	end
-
-	local ok, mouse = pcall(function()
-		return player:GetMouse()
-	end)
-	if not ok or mouse == nil then
-		failCursorCalibration("Mouse position is unavailable", now)
-		return
-	end
-
-	local points = {}
-	for _, point in ipairs(CALIBRATION_POINTS) do
-		points[#points + 1] = {
-			x = round(viewport.X * point.x),
-			y = round(viewport.Y * point.y),
-		}
-	end
-
-	state.calibrationRequested = false
-	state.calibration = {
-		mouse = mouse,
-		points = points,
-		index = 1,
-		samples = {},
-		viewportX = viewport.X,
-		viewportY = viewport.Y,
-		deadline = now + CALIBRATION_TIMEOUT,
-	}
-	state.records = {}
-	cancelPendingInput("Aligning cursor")
-	setCalibrationStatus("Calibrating automatically")
-	moveCalibrationCursor(state.calibration, now)
-end
-
-local function measureCalibrationAxis(samples, commandField, observedField)
-	local first = samples[1]
-	local last = samples[#samples]
-	local observedSpan = last[observedField] - first[observedField]
-	local commandSpan = last[commandField] - first[commandField]
-	if observedSpan < 20 or commandSpan < 20 then
-		return nil
-	end
-
-	local scale = commandSpan / observedSpan
-	if scale < CALIBRATION_MIN_SCALE - 0.05 or scale > CALIBRATION_MAX_SCALE + 0.10 then
-		return nil
-	end
-
-	for index = 2, #samples do
-		local previous = samples[index - 1]
-		local current = samples[index]
-		local observedDelta = current[observedField] - previous[observedField]
-		local commandDelta = current[commandField] - previous[commandField]
-		if observedDelta < 8 or commandDelta < 8 then
-			return nil
-		end
-		local segmentScale = commandDelta / observedDelta
-		if math.abs(segmentScale - scale) > math.max(0.05, scale * 0.08) then
-			return nil
-		end
-	end
-
-	return scale
-end
-
-local function completeCursorCalibration(calibration)
-	local scaleX = measureCalibrationAxis(calibration.samples, "commandX", "actualX")
-	local scaleY = measureCalibrationAxis(calibration.samples, "commandY", "actualY")
-	if scaleX == nil or scaleY == nil then
-		return false, "Mouse position readings were inconsistent"
-	end
-	if math.abs(scaleX - scaleY) > math.max(0.06, math.max(scaleX, scaleY) * 0.08) then
-		return false, "Horizontal and vertical scales did not match"
-	end
-
-	local scale = clamp((scaleX + scaleY) * 0.5, CALIBRATION_MIN_SCALE, CALIBRATION_MAX_SCALE)
-	local dpi = round(scale * REFERENCE_DPI)
-	if dpi < round(CALIBRATION_MIN_SCALE * REFERENCE_DPI) or dpi > round(CALIBRATION_MAX_SCALE * REFERENCE_DPI) then
-		return false, "Detected cursor scale is out of range"
-	end
-
-	config.windowsDpi = dpi
-	state.calibration = nil
-	state.calibrationRequested = false
-	state.calibrationFailed = false
-	state.cursorCalibrated = true
-	state.calibrationAttempts = 0
-	state.viewportX = calibration.viewportX
-	state.viewportY = calibration.viewportY
-	armCameraGuard()
-
-	local percentage = round(dpi / REFERENCE_DPI * 100)
-	setCalibrationStatus("Automatic | " .. percentage .. "%")
-	log(string.format("Cursor calibrated: %.3f x %.3f (%d%%)", scaleX, scaleY, percentage))
-	return true
-end
-
-local function updateCursorCalibration(now)
-	if now - state.lastViewportCheck >= 0.5 then
-		state.lastViewportCheck = now
-		local camera = Workspace.CurrentCamera
-		local viewport = camera ~= nil and camera.ViewportSize or nil
-		if viewport ~= nil and viewport.X > 0 and viewport.Y > 0 then
-			if state.viewportX > 0 and (state.viewportX ~= viewport.X or state.viewportY ~= viewport.Y) then
-				requestCursorCalibration()
-			end
-			state.viewportX = viewport.X
-			state.viewportY = viewport.Y
-		end
-	end
-
-	local calibration = state.calibration
-	if calibration == nil then
-		if not state.calibrationRequested or now < state.calibrationRetryAt then
-			return
-		end
-		local reason = calibrationBlockReason()
-		if reason ~= nil then
-			if reason == "Roblox is not focused" then
-				setCalibrationStatus("Waiting for Roblox focus")
-			end
-			return
-		end
-		beginCursorCalibration(now)
-		return
-	end
-
-	local reason = calibrationBlockReason()
-	if reason ~= nil then
-		deferCursorCalibration(reason, now)
-		return
-	end
-	if now > calibration.deadline then
-		failCursorCalibration("Mouse position did not stabilize", now)
-		return
-	end
-	if now < calibration.readyAt then
-		return
-	end
-
-	local x, y = readCursorPosition(calibration.mouse)
-	if x == nil or y == nil then
-		failCursorCalibration("Mouse position could not be read", now)
-		return
-	end
-	if calibration.lastX == nil or math.abs(x - calibration.lastX) > 2 or math.abs(y - calibration.lastY) > 2 then
-		calibration.lastX = x
-		calibration.lastY = y
-		calibration.readyAt = now + math.max(0.012, state.frameSeconds)
-		return
-	end
-
-	calibration.samples[#calibration.samples + 1] = {
-		commandX = calibration.commandX,
-		commandY = calibration.commandY,
-		actualX = x,
-		actualY = y,
-	}
-
-	if #calibration.samples == #calibration.points then
-		local calibrated, calibrationError = completeCursorCalibration(calibration)
-		if not calibrated then
-			failCursorCalibration(calibrationError, now)
-		end
-		return
-	end
-
-	calibration.index = calibration.index + 1
-	moveCalibrationCursor(calibration, now)
-end
-
 local function resolveBlockReason()
 	if not isCurrentRun() then
 		return "Script is no longer active"
 	end
 	if not state.resolveEnabled then
 		return "Resolve is disabled"
-	end
-	if state.calibration ~= nil or state.calibrationRequested then
-		return "Cursor alignment is in progress"
 	end
 	if not isrbxactive() then
 		return "Roblox is not focused"
@@ -706,9 +614,6 @@ local function pauseReason()
 	end
 	if state.resolve ~= nil then
 		return "Casting Resolve"
-	end
-	if state.calibration ~= nil or state.calibrationRequested then
-		return "Cursor alignment is in progress"
 	end
 	if ismouse2pressed() then
 		armCameraGuard()
@@ -1039,12 +944,13 @@ local function restoreDefaults()
 		setUIValue(setting.id, value)
 	end
 
-	config.windowsDpi = DEFAULT_CONFIG.windowsDpi
+	setDisplayDpi(DEFAULT_CONFIG.windowsDpi, "Default", true)
+	state.displayLocked = false
+	state.displayProbeRequested = true
 	config.dualScan = DEFAULT_CONFIG.dualScan
 	config.debug = DEFAULT_CONFIG.debug
 	setUIValue("ab_dual_scan", config.dualScan)
 	setUIValue("ab_debug", config.debug)
-	requestCursorCalibration()
 	log("Settings restored")
 	state.lastUISync = 0
 end
@@ -1074,7 +980,7 @@ local function syncStats(now)
 	setUIValue("ab_accuracy", string.format("%.1f%% | %d %s", accuracy, stats.misses, errors))
 	setUIValue("ab_completion_rate", string.format("%d / %d | %.1f notes/min", stats.clicks, total, notesPerMinute))
 	setUIValue("ab_ring_timing", timing)
-	setUIValue("ab_cursor_alignment", state.calibrationStatus)
+	setUIValue("ab_cursor_alignment", state.displayStatus)
 end
 
 local function scanFrame(now)
@@ -1136,20 +1042,18 @@ if state.hasUI then
 		local cursor = tab:Section("Cursor & Display", "Left")
 		addSlider(cursor, "mouseWigglePx", "Hover Movement (px)")
 		cursor:Tip("Small movement makes notes register under the cursor.")
-		cursor:InputText("ab_cursor_alignment", "Cursor Alignment", state.calibrationStatus)
-		cursor:Button("Recalibrate Cursor", requestCursorCalibration)
-		cursor:Tip("Automatically adapts to Windows display scaling.")
-		if state.calibrationFailed then
-			cursor:SliderInt(
-				"ab_scale_override",
-				"Manual Scale (%)",
-				100,
-				500,
-				round(config.windowsDpi / REFERENCE_DPI * 100),
-				setManualScale
-			)
-			cursor:Tip("Shown only when automatic calibration is unavailable.")
-		end
+		cursor:SliderInt(
+			"ab_display_scale",
+			"Display Scale (%)",
+			100,
+			500,
+			round(config.windowsDpi / REFERENCE_DPI * 100),
+			setManualDisplayScale
+		)
+		cursor:Tip("Match Windows Settings > System > Display > Scale. Saved automatically.")
+		cursor:InputText("ab_cursor_alignment", "Cursor Alignment", state.displayStatus)
+		cursor:Button("Detect Display Scale", requestDisplayCalibration)
+		cursor:Tip("Keeps the current setting when no reliable display data is available.")
 
 		local detection = tab:Section("Performance", "Right")
 		addSlider(detection, "scanIntervalMs", "Scan Interval (ms)")
@@ -1201,7 +1105,8 @@ local renderConnection = RunService.RenderStepped:Connect(function(deltaTime)
 
 	updateKeys()
 	syncSettings(now)
-	updateCursorCalibration(now)
+	updateDisplayAlignment(now)
+	saveDisplayAlignment(now)
 	finishResolve(now)
 	if state.enabled ~= state.lastEnabled then
 		state.lastEnabled = state.enabled
