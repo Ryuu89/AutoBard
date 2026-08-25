@@ -14,7 +14,6 @@ local RESOLVE_SETTLE_DELAY = 0.016
 local DISPLAY_SETTINGS_FILE = "AutoBard.display.cfg"
 local DISPLAY_CALIBRATION_TIMEOUT = 45
 local DISPLAY_NOTE_LIFETIME = 0.45
-local DISPLAY_MAX_WINDOW_OFFSET = 32768
 
 local RUN_TOKEN = {}
 _G.__MATCHA_AUTOBARD_RUN_TOKEN = RUN_TOKEN
@@ -58,7 +57,7 @@ for key, value in pairs(DEFAULT_CONFIG) do
 	config[key] = value
 end
 
-local function readStoredDisplayAlignment()
+local function readStoredDisplayDpi()
 	if type(isfile) ~= "function" or type(readfile) ~= "function" then
 		return nil
 	end
@@ -73,41 +72,20 @@ local function readStoredDisplayAlignment()
 		return nil
 	end
 
-	local dpi, offsetX, offsetY, viewportX, viewportY =
-		string.match(content, "^%s*(%d+),(%-?%d+),(%-?%d+),(%d+),(%d+)%s*$")
+	local dpi = tonumber(content)
 	if dpi == nil then
-		dpi = tonumber(content)
-		offsetX, offsetY, viewportX, viewportY = 0, 0, 0, 0
-	else
-		dpi = tonumber(dpi)
-		offsetX = tonumber(offsetX)
-		offsetY = tonumber(offsetY)
-		viewportX = tonumber(viewportX)
-		viewportY = tonumber(viewportY)
+		dpi = tonumber(string.match(content, "^%s*(%d+),"))
 	end
-
 	if type(dpi) ~= "number" or dpi < REFERENCE_DPI or dpi > REFERENCE_DPI * 5 then
 		return nil
 	end
-	if math.abs(offsetX) > DISPLAY_MAX_WINDOW_OFFSET or math.abs(offsetY) > DISPLAY_MAX_WINDOW_OFFSET then
-		return nil
-	end
-	if viewportX > DISPLAY_MAX_WINDOW_OFFSET or viewportY > DISPLAY_MAX_WINDOW_OFFSET then
-		return nil
-	end
 
-	return {
-		dpi = math.floor(dpi + 0.5),
-		offsetX = offsetX,
-		offsetY = offsetY,
-		viewportX = viewportX,
-		viewportY = viewportY,
-	}
+	return math.floor(dpi + 0.5)
 end
 
-local storedDisplayAlignment = readStoredDisplayAlignment()
-if storedDisplayAlignment ~= nil then
-	config.windowsDpi = storedDisplayAlignment.dpi
+local storedDisplayDpi = readStoredDisplayDpi()
+if storedDisplayDpi ~= nil then
+	config.windowsDpi = storedDisplayDpi
 end
 
 local settingsByName = {}
@@ -137,16 +115,11 @@ local state = {
 	resolveHotkeyName = "R",
 	shiftLockOn = false,
 	cameraGuardUntil = 0,
-	displaySource = storedDisplayAlignment ~= nil and "Saved" or "Default",
-	displayStatus = (storedDisplayAlignment ~= nil and "Saved" or "Default") .. " | " .. math.floor(
+	displaySource = storedDisplayDpi ~= nil and "Saved" or "Default",
+	displayStatus = (storedDisplayDpi ~= nil and "Saved" or "Default") .. " | " .. math.floor(
 		config.windowsDpi / REFERENCE_DPI * 100 + 0.5
 	) .. "%",
 	displayCalibration = nil,
-	displayOffsetX = storedDisplayAlignment ~= nil and storedDisplayAlignment.offsetX or 0,
-	displayOffsetY = storedDisplayAlignment ~= nil and storedDisplayAlignment.offsetY or 0,
-	displayViewportX = storedDisplayAlignment ~= nil and storedDisplayAlignment.viewportX or 0,
-	displayViewportY = storedDisplayAlignment ~= nil and storedDisplayAlignment.viewportY or 0,
-	lastDisplayViewportCheck = 0,
 	displaySavePending = false,
 	displaySaveAt = 0,
 	syncingDisplayScale = false,
@@ -210,10 +183,6 @@ local function setDisplayDpi(value, source, persist)
 	state.displaySource = source
 	local percentage = round(dpi / REFERENCE_DPI * 100)
 	state.displayStatus = source .. " | " .. percentage .. "%"
-	if state.displayOffsetX ~= 0 or state.displayOffsetY ~= 0 then
-		state.displayStatus = state.displayStatus
-			.. string.format(" | offset %+d,%+d", state.displayOffsetX, state.displayOffsetY)
-	end
 	state.syncingDisplayScale = true
 	setUIValue("ab_display_scale", percentage)
 	state.syncingDisplayScale = false
@@ -241,7 +210,7 @@ end
 
 local function requestDisplayCalibration()
 	if state.displayCalibration ~= nil then
-		notify("Click the center of the first Bard note to finish calibration.", "Cursor Calibration", 4)
+		notify("Click the center of the first Bard note to finish calibration.", "Display Calibration", 4)
 		return
 	end
 
@@ -261,55 +230,17 @@ local function requestDisplayCalibration()
 	}
 	state.displayStatus = "Start a song and click the first note"
 	setUIValue("ab_cursor_alignment", state.displayStatus)
-	notify("Start a song and click the center of the first Bard note.", "Cursor Calibration", 6)
+	notify("Start a song and click the center of the first Bard note.", "Display Calibration", 6)
 end
 
-local function saveDisplayAlignment(now)
+local function saveDisplayScale(now)
 	if not state.displaySavePending or now < state.displaySaveAt then
 		return
 	end
 	state.displaySavePending = false
 	if type(writefile) == "function" then
-		local alignment = string.format(
-			"%d,%d,%d,%d,%d",
-			config.windowsDpi,
-			state.displayOffsetX,
-			state.displayOffsetY,
-			state.displayViewportX,
-			state.displayViewportY
-		)
-		pcall(writefile, DISPLAY_SETTINGS_FILE, alignment)
+		pcall(writefile, DISPLAY_SETTINGS_FILE, tostring(config.windowsDpi))
 	end
-end
-
-local function updateDisplayViewport(now)
-	if state.displayCalibration ~= nil or now - state.lastDisplayViewportCheck < 0.5 then
-		return
-	end
-	state.lastDisplayViewportCheck = now
-
-	if state.displayViewportX <= 0 or state.displayViewportY <= 0 then
-		return
-	end
-
-	local camera = Workspace.CurrentCamera
-	if camera == nil then
-		return
-	end
-	local viewport = camera.ViewportSize
-	if viewport == nil or viewport.X <= 0 or viewport.Y <= 0 then
-		return
-	end
-	if viewport.X == state.displayViewportX and viewport.Y == state.displayViewportY then
-		return
-	end
-
-	state.displayOffsetX = 0
-	state.displayOffsetY = 0
-	state.displayViewportX = 0
-	state.displayViewportY = 0
-	setDisplayDpi(config.windowsDpi, "Window changed", true)
-	notify("Roblox was resized. Run Calibrate Cursor again.", "Cursor Calibration", 5)
 end
 
 local function setNumber(name, value, minimum, maximum)
@@ -436,7 +367,7 @@ end
 
 local function mapCursorPosition(x, y)
 	local scale = config.windowsDpi / REFERENCE_DPI
-	return round(x * scale + state.displayOffsetX), round(y * scale + state.displayOffsetY)
+	return round(x * scale), round(y * scale)
 end
 
 local function startResolve()
@@ -625,26 +556,19 @@ local function readNote(button)
 		key = tostring(address),
 		x = position.X + buttonSize.X * 0.5,
 		y = position.Y + buttonSize.Y * 0.5,
+		radius = math.max(buttonSize.X, buttonSize.Y) * 0.5,
 		size = math.max(ringSize.X, ringSize.Y),
 	}
 end
 
-local function finishDisplayCalibration(calibration, alignment, message)
+local function finishDisplayCalibration(calibration, dpi, message)
 	if state.displayCalibration ~= calibration then
 		return
 	end
 
 	state.displayCalibration = nil
-	if alignment ~= nil then
-		state.displayOffsetX = alignment.offsetX
-		state.displayOffsetY = alignment.offsetY
-
-		local camera = Workspace.CurrentCamera
-		local viewport = camera ~= nil and camera.ViewportSize or nil
-		state.displayViewportX = viewport ~= nil and round(viewport.X) or 0
-		state.displayViewportY = viewport ~= nil and round(viewport.Y) or 0
-
-		setDisplayDpi(alignment.dpi, "Calibrated", true)
+	if dpi ~= nil then
+		setDisplayDpi(dpi, "Calibrated", true)
 	else
 		setDisplayDpi(config.windowsDpi, state.displaySource, false)
 	end
@@ -652,7 +576,7 @@ local function finishDisplayCalibration(calibration, alignment, message)
 	state.enabled = calibration.resumeAutoplay
 	state.lastEnabled = state.enabled
 	setUIValue("ab_master", state.enabled)
-	notify(message, "Cursor Calibration", alignment ~= nil and 5 or 6)
+	notify(message, "Display Calibration", dpi ~= nil and 5 or 6)
 end
 
 local function collectCalibrationNotes(calibration, now)
@@ -686,19 +610,34 @@ local function collectCalibrationNotes(calibration, now)
 	end
 end
 
-local function inferNoteAlignment(note, mouseX, mouseY)
-	if note == nil then
+local function inferNoteDisplayDpi(note, mouseX, mouseY)
+	if note == nil or type(mouseX) ~= "number" or type(mouseY) ~= "number" then
 		return nil
 	end
 
-	local scale = config.windowsDpi / REFERENCE_DPI
-	local offsetX = round(mouseX - note.x * scale)
-	local offsetY = round(mouseY - note.y * scale)
-	if math.abs(offsetX) > DISPLAY_MAX_WINDOW_OFFSET or math.abs(offsetY) > DISPLAY_MAX_WINDOW_OFFSET then
+	local denominator = note.x * note.x + note.y * note.y
+	if denominator <= 0 then
 		return nil
 	end
 
-	return { dpi = config.windowsDpi, offsetX = offsetX, offsetY = offsetY }
+	local scale = (mouseX * note.x + mouseY * note.y) / denominator
+	if scale < 0.9 or scale > 5.1 then
+		return nil
+	end
+
+	local errorX = mouseX - note.x * scale
+	local errorY = mouseY - note.y * scale
+	local error = math.sqrt(errorX * errorX + errorY * errorY)
+	if error > math.max(16, note.radius * scale) then
+		return nil
+	end
+
+	local currentScale = config.windowsDpi / REFERENCE_DPI
+	if math.abs(scale - currentScale) <= 0.018 then
+		return config.windowsDpi
+	end
+
+	return clamp(round(scale * REFERENCE_DPI), REFERENCE_DPI, REFERENCE_DPI * 5)
 end
 
 local function updateGuidedDisplayCalibration(now)
@@ -707,7 +646,7 @@ local function updateGuidedDisplayCalibration(now)
 		return
 	end
 	if now - calibration.startedAt >= DISPLAY_CALIBRATION_TIMEOUT then
-		finishDisplayCalibration(calibration, nil, "Calibration timed out. The previous alignment was kept.")
+		finishDisplayCalibration(calibration, nil, "Calibration timed out. The previous scale was kept.")
 		return
 	end
 
@@ -742,24 +681,18 @@ local function updateGuidedDisplayCalibration(now)
 		return mouse.X, mouse.Y
 	end)
 	if not ok or type(mouseX) ~= "number" or type(mouseY) ~= "number" then
-		finishDisplayCalibration(
-			calibration,
-			nil,
-			"Mouse coordinates are unavailable. The previous alignment was kept."
-		)
+		finishDisplayCalibration(calibration, nil, "Mouse coordinates are unavailable. The previous scale was kept.")
 		return
 	end
 
-	local alignment = inferNoteAlignment(firstNote, mouseX, mouseY)
-	if alignment == nil then
-		finishDisplayCalibration(calibration, nil, "Window coordinates are invalid. The previous alignment was kept.")
+	local dpi = inferNoteDisplayDpi(firstNote, mouseX, mouseY)
+	if dpi == nil then
+		finishDisplayCalibration(calibration, nil, "The note position was invalid. The previous scale was kept.")
 		return
 	end
 
-	local percentage = round(alignment.dpi / REFERENCE_DPI * 100)
-	local message =
-		string.format("Calibrated: %d%% | window offset %+d,%+d.", percentage, alignment.offsetX, alignment.offsetY)
-	finishDisplayCalibration(calibration, alignment, message)
+	local percentage = round(dpi / REFERENCE_DPI * 100)
+	finishDisplayCalibration(calibration, dpi, "Display scale calibrated to " .. percentage .. "%.")
 end
 
 local function updateVelocity(record, sample, now)
@@ -1030,17 +963,13 @@ local function restoreDefaults()
 		setUIValue(setting.id, value)
 	end
 
-	state.displayOffsetX = 0
-	state.displayOffsetY = 0
-	state.displayViewportX = 0
-	state.displayViewportY = 0
 	setDisplayDpi(DEFAULT_CONFIG.windowsDpi, "Default", true)
 	config.dualScan = DEFAULT_CONFIG.dualScan
 	config.debug = DEFAULT_CONFIG.debug
 	setUIValue("ab_dual_scan", config.dualScan)
 	setUIValue("ab_debug", config.debug)
 	if calibration ~= nil then
-		notify("Calibration canceled. Default settings restored.", "Cursor Calibration", 4)
+		notify("Calibration canceled. Default settings restored.", "Display Calibration", 4)
 	end
 	log("Settings restored")
 	state.lastUISync = 0
@@ -1159,9 +1088,9 @@ if state.hasUI then
 			setManualDisplayScale
 		)
 		cursor:Tip("Match Windows Settings > System > Display > Scale. Saved automatically.")
-		cursor:InputText("ab_cursor_alignment", "Cursor Alignment", state.displayStatus)
-		cursor:Button("Calibrate Cursor", requestDisplayCalibration)
-		cursor:Tip("Click the first Bard note once to align fullscreen or windowed playback.")
+		cursor:InputText("ab_cursor_alignment", "Calibration Status", state.displayStatus)
+		cursor:Button("Calibrate Display Scale", requestDisplayCalibration)
+		cursor:Tip("Click the first Bard note once to calculate the display scale.")
 
 		local detection = tab:Section("Performance", "Right")
 		addSlider(detection, "scanIntervalMs", "Scan Interval (ms)")
@@ -1213,9 +1142,8 @@ local renderConnection = RunService.RenderStepped:Connect(function(deltaTime)
 
 	updateKeys()
 	syncSettings(now)
-	updateDisplayViewport(now)
 	updateGuidedDisplayCalibration(now)
-	saveDisplayAlignment(now)
+	saveDisplayScale(now)
 	finishResolve(now)
 	updatePlaybackClock(now)
 	if state.enabled ~= state.lastEnabled then
