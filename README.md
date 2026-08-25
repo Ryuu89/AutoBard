@@ -11,7 +11,7 @@ Run the following loader in Matcha:
 ## Features
 
 - Accurate OuterRing tracking with configurable click timing.
-- Verified display-scale detection with persistent, percentage-based cursor alignment.
+- Guided Bard-note display calibration with automatic profile persistence.
 - Configurable autoplay and Resolve hotkeys.
 - Camera-safe input handling while holding right click or using Shift Lock.
 - Live accuracy, error, completion, and click-timing statistics.
@@ -21,8 +21,8 @@ Run the following loader in Matcha:
 - Toggle autoplay: X by default.
 - Trigger Resolve: R by default.
 - Both shortcuts can be changed in the AutoBard tab.
-- Match Display Scale (%) to Windows Settings > System > Display > Scale; it is saved automatically.
-- Detect Display Scale never overwrites a working value without reliable display data.
+- Click Detect Display Scale, start a song, and click the center of one Bard note.
+- The measured scale is saved automatically, and autoplay resumes after calibration.
 
 ## Requirements
 
