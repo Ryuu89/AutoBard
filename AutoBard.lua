@@ -117,7 +117,8 @@ local state = {
 	lastScan = 0,
 	lastConfigSync = 0,
 	lastUISync = 0,
-	sessionStartedAt = tick(),
+	playbackElapsed = 0,
+	playbackStartedAt = nil,
 	frameSeconds = 1 / 60,
 	scanNumber = 0,
 	scanInProgress = false,
@@ -925,7 +926,8 @@ local function scanNotes(now)
 end
 
 local function resetStats()
-	state.sessionStartedAt = tick()
+	state.playbackElapsed = 0
+	state.playbackStartedAt = state.enabled and tick() or nil
 	state.stats = newStats()
 	state.records = {}
 	state.prepared = nil
@@ -949,6 +951,20 @@ local function restoreDefaults()
 	state.lastUISync = 0
 end
 
+local function updatePlaybackClock(now)
+	if state.enabled then
+		if state.playbackStartedAt == nil then
+			state.playbackStartedAt = now
+		end
+		return
+	end
+
+	if state.playbackStartedAt ~= nil then
+		state.playbackElapsed = state.playbackElapsed + math.max(0, now - state.playbackStartedAt)
+		state.playbackStartedAt = nil
+	end
+end
+
 local function syncStats(now)
 	if not state.hasUI or now - state.lastUISync < 0.25 then
 		return
@@ -958,7 +974,10 @@ local function syncStats(now)
 	local stats = state.stats
 	local total = stats.clicks + stats.misses
 	local accuracy = total > 0 and stats.clicks / total * 100 or 0
-	local elapsed = math.max(0, now - state.sessionStartedAt)
+	local elapsed = state.playbackElapsed
+	if state.enabled and state.playbackStartedAt ~= nil then
+		elapsed = elapsed + math.max(0, now - state.playbackStartedAt)
+	end
 	local notesPerMinute = elapsed > 0 and stats.clicks / elapsed * 60 or 0
 	local errors = stats.misses == 1 and "error" or "errors"
 	local timing = "No notes clicked yet"
@@ -1102,6 +1121,7 @@ local renderConnection = RunService.RenderStepped:Connect(function(deltaTime)
 	updateGuidedDisplayCalibration(now)
 	saveDisplayAlignment(now)
 	finishResolve(now)
+	updatePlaybackClock(now)
 	if state.enabled ~= state.lastEnabled then
 		state.lastEnabled = state.enabled
 		if not state.enabled then
