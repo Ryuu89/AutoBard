@@ -14,7 +14,6 @@ local RESOLVE_SETTLE_DELAY = 0.016
 local DISPLAY_SETTINGS_FILE = "AutoBard.display.cfg"
 local DISPLAY_CALIBRATION_TIMEOUT = 45
 local DISPLAY_NOTE_LIFETIME = 0.45
-local DISPLAY_MIN_NOTE_DISTANCE = 32
 local DISPLAY_MAX_WINDOW_OFFSET = 32768
 
 local RUN_TOKEN = {}
@@ -242,10 +241,7 @@ end
 
 local function requestDisplayCalibration()
 	if state.displayCalibration ~= nil then
-		local message = state.displayCalibration.anchor == nil
-				and "Click the first Bard note to set the window reference."
-			or "Click the center of a different Bard note to finish calibration."
-		notify(message, "Display Calibration", 4)
+		notify("Click the center of the first Bard note to finish calibration.", "Cursor Calibration", 4)
 		return
 	end
 
@@ -261,12 +257,11 @@ local function requestDisplayCalibration()
 		lastMouseDown = ismouse1pressed(),
 		notes = {},
 		firstNote = nil,
-		anchor = nil,
 		resumeAutoplay = wasEnabled,
 	}
-	state.displayStatus = "Step 1/2 - start a song"
+	state.displayStatus = "Start a song and click the first note"
 	setUIValue("ab_cursor_alignment", state.displayStatus)
-	notify("Start a song and click the first Bard note, then click another note.", "Display Calibration", 7)
+	notify("Start a song and click the center of the first Bard note.", "Cursor Calibration", 6)
 end
 
 local function saveDisplayAlignment(now)
@@ -314,7 +309,7 @@ local function updateDisplayViewport(now)
 	state.displayViewportX = 0
 	state.displayViewportY = 0
 	setDisplayDpi(config.windowsDpi, "Window changed", true)
-	notify("Roblox was resized. Run Detect Display Scale again.", "Display Calibration", 5)
+	notify("Roblox was resized. Run Calibrate Cursor again.", "Cursor Calibration", 5)
 end
 
 local function setNumber(name, value, minimum, maximum)
@@ -630,7 +625,6 @@ local function readNote(button)
 		key = tostring(address),
 		x = position.X + buttonSize.X * 0.5,
 		y = position.Y + buttonSize.Y * 0.5,
-		radius = math.max(buttonSize.X, buttonSize.Y) * 0.5,
 		size = math.max(ringSize.X, ringSize.Y),
 	}
 end
@@ -658,7 +652,7 @@ local function finishDisplayCalibration(calibration, alignment, message)
 	state.enabled = calibration.resumeAutoplay
 	state.lastEnabled = state.enabled
 	setUIValue("ab_master", state.enabled)
-	notify(message, "Display Calibration", alignment ~= nil and 5 or 6)
+	notify(message, "Cursor Calibration", alignment ~= nil and 5 or 6)
 end
 
 local function collectCalibrationNotes(calibration, now)
@@ -673,7 +667,7 @@ local function collectCalibrationNotes(calibration, now)
 				if valid and sample ~= nil then
 					sample.seenAt = now
 					calibration.notes[sample.key] = sample
-					if calibration.anchor == nil and calibration.firstNote == nil then
+					if calibration.firstNote == nil then
 						calibration.firstNote = sample
 					end
 				end
@@ -681,76 +675,30 @@ local function collectCalibrationNotes(calibration, now)
 		end
 	end
 
-	local count = 0
 	for key, sample in pairs(calibration.notes) do
 		if now - sample.seenAt > DISPLAY_NOTE_LIFETIME then
 			calibration.notes[key] = nil
-		else
-			count = count + 1
 		end
 	end
 
-	if calibration.anchor == nil and calibration.firstNote ~= nil then
-		if calibration.notes[calibration.firstNote.key] == nil then
-			calibration.firstNote = nil
-		end
+	if calibration.firstNote ~= nil and calibration.notes[calibration.firstNote.key] == nil then
+		calibration.firstNote = nil
 	end
-
-	return count
 end
 
-local function inferWindowAlignment(calibration, mouseX, mouseY)
-	local anchor = calibration.anchor
-	if anchor == nil then
+local function inferNoteAlignment(note, mouseX, mouseY)
+	if note == nil then
 		return nil
 	end
 
-	local cursorDeltaX = mouseX - anchor.mouseX
-	local cursorDeltaY = mouseY - anchor.mouseY
-	local currentScale = config.windowsDpi / REFERENCE_DPI
-	local bestNote = nil
-	local bestScale = nil
-	local bestScore = math.huge
-
-	for _, sample in pairs(calibration.notes) do
-		if sample.key ~= anchor.key then
-			local noteDeltaX = sample.x - anchor.noteX
-			local noteDeltaY = sample.y - anchor.noteY
-			local distanceSquared = noteDeltaX * noteDeltaX + noteDeltaY * noteDeltaY
-			if distanceSquared >= DISPLAY_MIN_NOTE_DISTANCE * DISPLAY_MIN_NOTE_DISTANCE then
-				local scale = (cursorDeltaX * noteDeltaX + cursorDeltaY * noteDeltaY) / distanceSquared
-				if scale >= 0.9 and scale <= 5.1 then
-					local errorX = cursorDeltaX - noteDeltaX * scale
-					local errorY = cursorDeltaY - noteDeltaY * scale
-					local error = math.sqrt(errorX * errorX + errorY * errorY)
-					local tolerance = math.max(18, (anchor.radius + sample.radius) * scale * 0.6)
-					if error <= tolerance then
-						local score = error + math.abs(scale - currentScale) * 8
-						if score < bestScore then
-							bestNote = sample
-							bestScale = scale
-							bestScore = score
-						end
-					end
-				end
-			end
-		end
-	end
-
-	if bestNote == nil or bestScale == nil then
-		return nil
-	end
-
-	local dpi = math.abs(bestScale - currentScale) <= 0.018 and config.windowsDpi
-		or clamp(round(bestScale * REFERENCE_DPI), REFERENCE_DPI, REFERENCE_DPI * 5)
-	local scale = dpi / REFERENCE_DPI
-	local offsetX = round((anchor.mouseX - anchor.noteX * scale + mouseX - bestNote.x * scale) * 0.5)
-	local offsetY = round((anchor.mouseY - anchor.noteY * scale + mouseY - bestNote.y * scale) * 0.5)
+	local scale = config.windowsDpi / REFERENCE_DPI
+	local offsetX = round(mouseX - note.x * scale)
+	local offsetY = round(mouseY - note.y * scale)
 	if math.abs(offsetX) > DISPLAY_MAX_WINDOW_OFFSET or math.abs(offsetY) > DISPLAY_MAX_WINDOW_OFFSET then
 		return nil
 	end
 
-	return { dpi = dpi, offsetX = offsetX, offsetY = offsetY }
+	return { dpi = config.windowsDpi, offsetX = offsetX, offsetY = offsetY }
 end
 
 local function updateGuidedDisplayCalibration(now)
@@ -770,13 +718,18 @@ local function updateGuidedDisplayCalibration(now)
 		return
 	end
 
-	local noteCount = collectCalibrationNotes(calibration, now)
-	if calibration.anchor == nil and calibration.firstNote ~= nil then
-		local firstNote = calibration.firstNote
-		state.displayStatus = string.format("Step 1/2 - first note at %d,%d", round(firstNote.x), round(firstNote.y))
-		setUIValue("ab_cursor_alignment", state.displayStatus)
+	collectCalibrationNotes(calibration, now)
+	local firstNote = calibration.firstNote
+	if firstNote == nil then
+		return
 	end
-	if not clicked or noteCount == 0 then
+
+	local status = string.format("Click first note at %d,%d", round(firstNote.x), round(firstNote.y))
+	if state.displayStatus ~= status then
+		state.displayStatus = status
+		setUIValue("ab_cursor_alignment", status)
+	end
+	if not clicked then
 		return
 	end
 
@@ -797,31 +750,9 @@ local function updateGuidedDisplayCalibration(now)
 		return
 	end
 
-	if calibration.anchor == nil then
-		local firstNote = calibration.firstNote
-		if firstNote == nil then
-			return
-		end
-
-		calibration.anchor = {
-			key = firstNote.key,
-			noteX = firstNote.x,
-			noteY = firstNote.y,
-			mouseX = mouseX,
-			mouseY = mouseY,
-			radius = firstNote.radius,
-		}
-		calibration.notes[firstNote.key] = nil
-		state.displayStatus = "Step 2/2 - click a different note"
-		setUIValue("ab_cursor_alignment", state.displayStatus)
-		notify("First note captured. Click the center of a different Bard note.", "Display Calibration", 5)
-		return
-	end
-
-	local alignment = inferWindowAlignment(calibration, mouseX, mouseY)
+	local alignment = inferNoteAlignment(firstNote, mouseX, mouseY)
 	if alignment == nil then
-		state.displayStatus = "Step 2/2 - click a note farther away"
-		setUIValue("ab_cursor_alignment", state.displayStatus)
+		finishDisplayCalibration(calibration, nil, "Window coordinates are invalid. The previous alignment was kept.")
 		return
 	end
 
@@ -1083,6 +1014,16 @@ local function resetStats()
 end
 
 local function restoreDefaults()
+	local calibration = state.displayCalibration
+	if calibration ~= nil then
+		state.displayCalibration = nil
+		state.enabled = calibration.resumeAutoplay
+		state.lastEnabled = state.enabled
+		state.prepared = nil
+		state.resolve = nil
+		setUIValue("ab_master", state.enabled)
+	end
+
 	for _, setting in ipairs(SETTINGS) do
 		local value = DEFAULT_CONFIG[setting.name]
 		setNumber(setting.name, value, setting.min, setting.max)
@@ -1098,6 +1039,9 @@ local function restoreDefaults()
 	config.debug = DEFAULT_CONFIG.debug
 	setUIValue("ab_dual_scan", config.dualScan)
 	setUIValue("ab_debug", config.debug)
+	if calibration ~= nil then
+		notify("Calibration canceled. Default settings restored.", "Cursor Calibration", 4)
+	end
 	log("Settings restored")
 	state.lastUISync = 0
 end
@@ -1216,8 +1160,8 @@ if state.hasUI then
 		)
 		cursor:Tip("Match Windows Settings > System > Display > Scale. Saved automatically.")
 		cursor:InputText("ab_cursor_alignment", "Cursor Alignment", state.displayStatus)
-		cursor:Button("Detect Display Scale", requestDisplayCalibration)
-		cursor:Tip("Click the first note, then a different note to calibrate display scale and window position.")
+		cursor:Button("Calibrate Cursor", requestDisplayCalibration)
+		cursor:Tip("Click the first Bard note once to align fullscreen or windowed playback.")
 
 		local detection = tab:Section("Performance", "Right")
 		addSlider(detection, "scanIntervalMs", "Scan Interval (ms)")
