@@ -14,6 +14,10 @@ local RESOLVE_SETTLE_DELAY = 0.016
 local DISPLAY_SETTINGS_FILE = "AutoBard.display.cfg"
 local DISPLAY_CALIBRATION_TIMEOUT = 45
 local DISPLAY_NOTE_LIFETIME = 0.45
+local SETTINGS_SYNC_INTERVAL = 0.05
+local STATS_SYNC_INTERVAL = 0.25
+local HOTKEY_SYNC_INTERVAL = 0.1
+local HOVER_REFRESH_INTERVAL = 0.008
 
 local RUN_TOKEN = {}
 _G.__MATCHA_AUTOBARD_RUN_TOKEN = RUN_TOKEN
@@ -120,12 +124,13 @@ local state = {
 		config.windowsDpi / REFERENCE_DPI * 100 + 0.5
 	) .. "%",
 	displayCalibration = nil,
-	displaySavePending = false,
-	displaySaveAt = 0,
+	displaySaveAt = nil,
 	syncingDisplayScale = false,
 	lastScan = 0,
 	lastConfigSync = 0,
 	lastUISync = 0,
+	hotkeySyncAt = {},
+	statusValues = {},
 	playbackElapsed = 0,
 	playbackStartedAt = nil,
 	frameSeconds = 1 / 60,
@@ -150,10 +155,14 @@ local function isCurrentRun()
 	return _G.__MATCHA_AUTOBARD_RUN_TOKEN == RUN_TOKEN
 end
 
-local function log(message)
-	if config.debug then
-		print("[AutoBard] " .. message)
+local function log(message, ...)
+	if not config.debug then
+		return
 	end
+	if select("#", ...) > 0 then
+		message = string.format(message, ...)
+	end
+	print("[AutoBard] " .. message)
 end
 
 local function getUIValue(id, default)
@@ -173,6 +182,17 @@ local function setUIValue(id, value)
 	end
 end
 
+local function setStatusValue(id, value)
+	if not state.hasUI or state.statusValues[id] == value then
+		return
+	end
+
+	local ok = pcall(UI.SetValue, id, value)
+	if ok then
+		state.statusValues[id] = value
+	end
+end
+
 local function setDisplayDpi(value, source, persist)
 	if type(value) ~= "number" or value ~= value then
 		return
@@ -186,10 +206,9 @@ local function setDisplayDpi(value, source, persist)
 	state.syncingDisplayScale = true
 	setUIValue("ab_display_scale", percentage)
 	state.syncingDisplayScale = false
-	setUIValue("ab_cursor_alignment", state.displayStatus)
+	setStatusValue("ab_cursor_alignment", state.displayStatus)
 
 	if persist then
-		state.displaySavePending = true
 		state.displaySaveAt = tick() + 0.35
 	end
 end
@@ -208,7 +227,7 @@ local function setManualDisplayScale(value)
 	setDisplayDpi(dpi, "Custom", true)
 end
 
-local function requestDisplayCalibration()
+local function startDisplayCalibration()
 	if state.displayCalibration ~= nil then
 		notify("Click the center of the first Bard note to finish calibration.", "Display Calibration", 4)
 		return
@@ -224,20 +243,21 @@ local function requestDisplayCalibration()
 	state.displayCalibration = {
 		startedAt = tick(),
 		lastMouseDown = ismouse1pressed(),
-		notes = {},
 		firstNote = nil,
 		resumeAutoplay = wasEnabled,
 	}
 	state.displayStatus = "Start a song and click the first note"
-	setUIValue("ab_cursor_alignment", state.displayStatus)
+	setStatusValue("ab_cursor_alignment", state.displayStatus)
 	notify("Start a song and click the center of the first Bard note.", "Display Calibration", 6)
 end
 
 local function saveDisplayScale(now)
-	if not state.displaySavePending or now < state.displaySaveAt then
+	local saveAt = state.displaySaveAt
+	if saveAt == nil or now < saveAt then
 		return
 	end
-	state.displaySavePending = false
+
+	state.displaySaveAt = nil
 	if type(writefile) == "function" then
 		pcall(writefile, DISPLAY_SETTINGS_FILE, tostring(config.windowsDpi))
 	end
@@ -262,7 +282,7 @@ local function addSlider(section, name, label)
 end
 
 local function syncSettings(now)
-	if not state.hasUI or now - state.lastConfigSync < 0.05 then
+	if not state.hasUI or now - state.lastConfigSync < SETTINGS_SYNC_INTERVAL then
 		return
 	end
 	state.lastConfigSync = now
@@ -305,6 +325,13 @@ local function updateHotkey(keybind, codeField, nameField, lastField)
 		return
 	end
 
+	local now = tick()
+	local previousSync = state.hotkeySyncAt[codeField] or 0
+	if now - previousSync < HOTKEY_SYNC_INTERVAL then
+		return
+	end
+	state.hotkeySyncAt[codeField] = now
+
 	local okCode, keyCode = pcall(function()
 		return keybind:GetKey()
 	end)
@@ -334,7 +361,7 @@ local function cancelPendingInput(reason)
 	end
 
 	state.prepared = nil
-	log("Pending cursor action canceled: " .. reason)
+	log("Pending cursor action canceled: %s", reason)
 end
 
 local function resolveBlockReason()
@@ -362,7 +389,7 @@ end
 local function cancelResolve(reason)
 	state.resolve = nil
 	armCameraGuard()
-	log("Resolve canceled: " .. reason)
+	log("Resolve canceled: %s", reason)
 end
 
 local function mapCursorPosition(x, y)
@@ -377,7 +404,7 @@ local function startResolve()
 
 	local reason = resolveBlockReason()
 	if reason ~= nil then
-		log("Resolve unavailable: " .. reason)
+		log("Resolve unavailable: %s", reason)
 		return false
 	end
 
@@ -434,7 +461,7 @@ local function finishResolve(now)
 	mouse2click()
 	state.resolve = nil
 	armCameraGuard()
-	log("Resolve used at " .. resolve.x .. ", " .. resolve.y)
+	log("Resolve used at %d, %d", resolve.x, resolve.y)
 end
 
 local function updateKeys()
@@ -561,7 +588,7 @@ local function readNote(button)
 	}
 end
 
-local function finishDisplayCalibration(calibration, dpi, message)
+local function completeDisplayCalibration(calibration, dpi, message)
 	if state.displayCalibration ~= calibration then
 		return
 	end
@@ -579,38 +606,32 @@ local function finishDisplayCalibration(calibration, dpi, message)
 	notify(message, "Display Calibration", dpi ~= nil and 5 or 6)
 end
 
-local function collectCalibrationNotes(calibration, now)
+local function refreshCalibrationNote(calibration, now)
 	local bardGui = getBardGui()
+	local previousNote = calibration.firstNote
+
 	if bardGui ~= nil then
 		local ok, buttons = pcall(function()
 			return bardGui:GetChildren()
 		end)
 		if ok and type(buttons) == "table" then
 			for _, button in ipairs(buttons) do
-				local valid, sample = pcall(readNote, button)
-				if valid and sample ~= nil then
-					sample.seenAt = now
-					calibration.notes[sample.key] = sample
-					if calibration.firstNote == nil then
-						calibration.firstNote = sample
-					end
+				local valid, note = pcall(readNote, button)
+				if valid and note ~= nil and (previousNote == nil or note.key == previousNote.key) then
+					note.seenAt = now
+					calibration.firstNote = note
+					return
 				end
 			end
 		end
 	end
 
-	for key, sample in pairs(calibration.notes) do
-		if now - sample.seenAt > DISPLAY_NOTE_LIFETIME then
-			calibration.notes[key] = nil
-		end
-	end
-
-	if calibration.firstNote ~= nil and calibration.notes[calibration.firstNote.key] == nil then
+	if previousNote ~= nil and now - previousNote.seenAt > DISPLAY_NOTE_LIFETIME then
 		calibration.firstNote = nil
 	end
 end
 
-local function inferNoteDisplayDpi(note, mouseX, mouseY)
+local function measureDisplayDpi(note, mouseX, mouseY)
 	if note == nil or type(mouseX) ~= "number" or type(mouseY) ~= "number" then
 		return nil
 	end
@@ -640,13 +661,13 @@ local function inferNoteDisplayDpi(note, mouseX, mouseY)
 	return clamp(round(scale * REFERENCE_DPI), REFERENCE_DPI, REFERENCE_DPI * 5)
 end
 
-local function updateGuidedDisplayCalibration(now)
+local function updateDisplayCalibration(now)
 	local calibration = state.displayCalibration
 	if calibration == nil then
 		return
 	end
 	if now - calibration.startedAt >= DISPLAY_CALIBRATION_TIMEOUT then
-		finishDisplayCalibration(calibration, nil, "Calibration timed out. The previous scale was kept.")
+		completeDisplayCalibration(calibration, nil, "Calibration timed out. The previous scale was kept.")
 		return
 	end
 
@@ -657,7 +678,7 @@ local function updateGuidedDisplayCalibration(now)
 		return
 	end
 
-	collectCalibrationNotes(calibration, now)
+	refreshCalibrationNote(calibration, now)
 	local firstNote = calibration.firstNote
 	if firstNote == nil then
 		return
@@ -666,7 +687,7 @@ local function updateGuidedDisplayCalibration(now)
 	local status = string.format("Click first note at %d,%d", round(firstNote.x), round(firstNote.y))
 	if state.displayStatus ~= status then
 		state.displayStatus = status
-		setUIValue("ab_cursor_alignment", status)
+		setStatusValue("ab_cursor_alignment", status)
 	end
 	if not clicked then
 		return
@@ -681,18 +702,18 @@ local function updateGuidedDisplayCalibration(now)
 		return mouse.X, mouse.Y
 	end)
 	if not ok or type(mouseX) ~= "number" or type(mouseY) ~= "number" then
-		finishDisplayCalibration(calibration, nil, "Mouse coordinates are unavailable. The previous scale was kept.")
+		completeDisplayCalibration(calibration, nil, "Mouse coordinates are unavailable. The previous scale was kept.")
 		return
 	end
 
-	local dpi = inferNoteDisplayDpi(firstNote, mouseX, mouseY)
+	local dpi = measureDisplayDpi(firstNote, mouseX, mouseY)
 	if dpi == nil then
-		finishDisplayCalibration(calibration, nil, "The note position was invalid. The previous scale was kept.")
+		completeDisplayCalibration(calibration, nil, "The note position was invalid. The previous scale was kept.")
 		return
 	end
 
 	local percentage = round(dpi / REFERENCE_DPI * 100)
-	finishDisplayCalibration(calibration, dpi, "Display scale calibrated to " .. percentage .. "%.")
+	completeDisplayCalibration(calibration, dpi, "Display scale calibrated to " .. percentage .. "%.")
 end
 
 local function updateVelocity(record, sample, now)
@@ -765,7 +786,7 @@ local function prepareCursor(sample)
 		lastWiggle = now,
 		wiggleDirection = 1,
 	}
-	log("Cursor prepared at " .. commandX .. ", " .. commandY .. " | hover motion=" .. wiggle .. " px")
+	log("Cursor prepared at %d, %d | hover motion=%d px", commandX, commandY, wiggle)
 	return true
 end
 
@@ -781,7 +802,7 @@ local function refreshHover()
 	end
 
 	local now = tick()
-	if now - prepared.lastWiggle < 0.008 then
+	if now - prepared.lastWiggle < HOVER_REFRESH_INTERVAL then
 		return true
 	end
 
@@ -808,15 +829,7 @@ local function clickNote(sample)
 	state.stats.clicks = state.stats.clicks + 1
 	state.stats.lastRingSize = sample.size
 	state.stats.totalRingSize = state.stats.totalRingSize + sample.size
-	log(
-		string.format(
-			"Clicked %d/%d px at %d, %d",
-			round(sample.size),
-			config.threshold,
-			round(sample.x),
-			round(sample.y)
-		)
-	)
+	log("Clicked %d/%d px at %d, %d", round(sample.size), config.threshold, round(sample.x), round(sample.y))
 	return true
 end
 
@@ -990,7 +1003,7 @@ local function updatePlaybackClock(now)
 end
 
 local function syncStats(now)
-	if not state.hasUI or now - state.lastUISync < 0.25 then
+	if not state.hasUI or now - state.lastUISync < STATS_SYNC_INTERVAL then
 		return
 	end
 	state.lastUISync = now
@@ -1014,10 +1027,10 @@ local function syncStats(now)
 		)
 	end
 
-	setUIValue("ab_accuracy", string.format("%.1f%% | %d %s", accuracy, stats.misses, errors))
-	setUIValue("ab_completion_rate", string.format("%d / %d | %.1f notes/min", stats.clicks, total, notesPerMinute))
-	setUIValue("ab_ring_timing", timing)
-	setUIValue("ab_cursor_alignment", state.displayStatus)
+	setStatusValue("ab_accuracy", string.format("%.1f%% | %d %s", accuracy, stats.misses, errors))
+	setStatusValue("ab_completion_rate", string.format("%d / %d | %.1f notes/min", stats.clicks, total, notesPerMinute))
+	setStatusValue("ab_ring_timing", timing)
+	setStatusValue("ab_cursor_alignment", state.displayStatus)
 end
 
 local function scanFrame(now)
@@ -1041,7 +1054,7 @@ local function scanFrame(now)
 	local ok, errorMessage = pcall(scanNotes, now)
 	state.scanInProgress = false
 	if not ok then
-		log("Note scan failed: " .. tostring(errorMessage))
+		log("Note scan failed: %s", tostring(errorMessage))
 	end
 end
 
@@ -1089,7 +1102,7 @@ if state.hasUI then
 		)
 		cursor:Tip("Match Windows Settings > System > Display > Scale. Saved automatically.")
 		cursor:InputText("ab_cursor_alignment", "Calibration Status", state.displayStatus)
-		cursor:Button("Calibrate Display Scale", requestDisplayCalibration)
+		cursor:Button("Calibrate Display Scale", startDisplayCalibration)
 		cursor:Tip("Click the first Bard note once to calculate the display scale.")
 
 		local detection = tab:Section("Performance", "Right")
@@ -1142,7 +1155,7 @@ local renderConnection = RunService.RenderStepped:Connect(function(deltaTime)
 
 	updateKeys()
 	syncSettings(now)
-	updateGuidedDisplayCalibration(now)
+	updateDisplayCalibration(now)
 	saveDisplayScale(now)
 	finishResolve(now)
 	updatePlaybackClock(now)
