@@ -11,7 +11,7 @@ Run the following loader in Matcha:
 ## Features
 
 - Accurate OuterRing tracking with configurable click timing.
-- Two-note display calibration for fullscreen, small windows, and window offsets.
+- One-note cursor calibration for fullscreen, small windows, and window offsets.
 - Configurable autoplay and Resolve hotkeys.
 - Camera-safe input handling while holding right click or using Shift Lock.
 - Live accuracy, error, completion, and click-timing statistics.
@@ -21,8 +21,8 @@ Run the following loader in Matcha:
 - Toggle autoplay: X by default.
 - Trigger Resolve: R by default.
 - Both shortcuts can be changed in the AutoBard tab.
-- Click Detect Display Scale, start a song, and click the first note, then a different note.
-- Display scale and window alignment are saved automatically; autoplay resumes after calibration.
+- Click Calibrate Cursor, start a song, and click the center of the first Bard note.
+- Your selected display scale is preserved; window alignment is saved and autoplay resumes automatically.
 
 ## Requirements
 
