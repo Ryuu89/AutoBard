@@ -9,6 +9,8 @@ local DEFAULT_RESOLVE_KEY = 0x52
 local VK_SHIFT = 0x10
 local REFERENCE_DPI = 96
 local MIN_RING_SIZE = 125
+-- Bard notes are 100 GUI px; Matcha can report AbsoluteSize as zero, so size falls back to geometry.
+local NOTE_SIZE_FALLBACK = 100
 local RESOLVE_MARGIN = 48
 local RESOLVE_SETTLE_DELAY = 0.016
 local DISPLAY_SETTINGS_FILE = "AutoBard.display.cfg"
@@ -204,7 +206,7 @@ local function setDisplayDpi(value, source, persist)
 	local percentage = round(dpi / REFERENCE_DPI * 100)
 	state.displayStatus = source .. " | " .. percentage .. "%"
 	state.syncingDisplayScale = true
-	setUIValue("ab_display_scale", percentage)
+	setUIValue("ab_display_scale_v2", percentage)
 	state.syncingDisplayScale = false
 	setStatusValue("ab_cursor_alignment", state.displayStatus)
 
@@ -307,7 +309,7 @@ local function syncSettings(now)
 		setNumber(setting.name, value, setting.min, setting.max)
 	end
 
-	setManualDisplayScale(getUIValue("ab_display_scale", nil))
+	setManualDisplayScale(getUIValue("ab_display_scale_v2", nil))
 
 	local dualScan = getUIValue("ab_dual_scan", config.dualScan)
 	if type(dualScan) == "boolean" then
@@ -573,18 +575,33 @@ local function readNote(button)
 
 	local address = button.Address
 	local position = button.AbsolutePosition
+	local ringPosition = ring.AbsolutePosition
+	if address == nil or position == nil or ringPosition == nil then
+		return nil
+	end
+	if position.X == 0 and position.Y == 0 then
+		return nil
+	end
+
 	local buttonSize = button.AbsoluteSize
 	local ringSize = ring.AbsoluteSize
-	if address == nil or position == nil or buttonSize == nil or ringSize == nil then
-		return nil
+	local buttonWidth = buttonSize ~= nil and math.max(buttonSize.X, buttonSize.Y) or 0
+	local ringWidth = ringSize ~= nil and math.max(ringSize.X, ringSize.Y) or 0
+	if buttonWidth <= 0 then
+		buttonWidth = NOTE_SIZE_FALLBACK
+	end
+	if ringWidth <= 0 then
+		-- OuterRing is centered on the button, so its top-left inset is half of the size difference.
+		local inset = math.max(position.X - ringPosition.X, position.Y - ringPosition.Y)
+		ringWidth = buttonWidth + inset * 2
 	end
 
 	return {
 		key = tostring(address),
-		x = position.X + buttonSize.X * 0.5,
-		y = position.Y + buttonSize.Y * 0.5,
-		radius = math.max(buttonSize.X, buttonSize.Y) * 0.5,
-		size = math.max(ringSize.X, ringSize.Y),
+		x = position.X + buttonWidth * 0.5,
+		y = position.Y + buttonWidth * 0.5,
+		radius = buttonWidth * 0.5,
+		size = ringWidth,
 	}
 end
 
@@ -1093,7 +1110,7 @@ if state.hasUI then
 		addSlider(cursor, "mouseWigglePx", "Hover Movement (px)")
 		cursor:Tip("Small movement makes notes register under the cursor.")
 		cursor:SliderInt(
-			"ab_display_scale",
+			"ab_display_scale_v2",
 			"Display Scale (%)",
 			100,
 			500,
@@ -1138,7 +1155,7 @@ else
 	warn("[AutoBard] Matcha UI Binding is unavailable; the default X hotkey remains active.")
 end
 notify(
-	"Auto Bard v1.0.0 by Ryuu89 is ready. Toggle: " .. state.hotkeyName .. " | Resolve: " .. state.resolveHotkeyName,
+	"Auto Bard v1.0.1 by Ryuu89 is ready. Toggle: " .. state.hotkeyName .. " | Resolve: " .. state.resolveHotkeyName,
 	"Auto Bard",
 	4
 )
